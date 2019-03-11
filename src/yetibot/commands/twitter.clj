@@ -48,7 +48,7 @@
 (defn track
   "twitter track <topic> # track a <topic> on the Twitter stream"
   [{[_ topic] :match user :user}]
-  (if (model/find-first {:topic topic})
+  (if (model/find-by-topic topic)
     (format "You're already tracking %s." topic)
     (do
       (model/add-topic (:id user) topic)
@@ -57,11 +57,25 @@
 (defn untrack
   "twitter untrack <topic> # stop tracking <topic>"
   [{[_ topic] :match}]
-  (if-let [topic-entity (model/find-first {:topic topic})]
+  (if-let [{topic-id :id} (first (model/find-by-topic topic))]
     (do
-      (model/remove-topic (:id topic-entity))
+      (model/remove-topic topic-id)
       (format "Stopped tracking %s" topic))
     (format "You're not tracking %s" topic)))
+
+(defn show
+  "twitter show <screen-name> # show top 10 tweets from user <scree-name>"
+  [{[_ screen-name] :match}]
+  (let [tweets (:body (model/user-timeline screen-name 10))]
+    (map model/format-tweet-text tweets)))
+
+(defn display
+  "twitter display <id> # display tweet with <id>"
+  [{[_ id] :match}]
+  (-> id
+      (model/show)
+      (get :body)
+      (model/format-tweet)))
 
 (defn search
   "twitter search <query> # find most recent 20 tweets matching <query>"
@@ -82,17 +96,17 @@
   [{[_ id status] :match}]
   (suppress (model/reply id status)))
 
-(if (model/configured?)
-  (cmd-hook #"twitter"
-    #"^lookup\s+(.+)" lookup
-    #"^tweet:*\s+(.+)" tweet
-    #"^following" following
-    #"^follow\s+(.+)" follow
-    #"^unfollow\s+(.+)" unfollow
-    #"^search\s+(.+)" search
-    #"^retweet\s+(\d+)" retweet
-    #"^reply\s+(\d+)\s+(.+)" reply
-    #"^tracking" tracking
-    #"^untrack\s+(.+)" untrack
-    #"^track\s+(.+)" track)
-  (info "Twitter is not configured."))
+(cmd-hook #"twitter"
+  #"^lookup\s+(.+)" lookup
+  #"^tweet:*\s+(.+)" tweet
+  #"^following" following
+  #"^follow\s+(.+)" follow
+  #"^unfollow\s+(.+)" unfollow
+  #"^search\s+(.+)" search
+  #"^show\s+(\S+)" show
+  #"^display\s+(\d+)" display
+  #"^retweet\s+(\d+)" retweet
+  #"^reply\s+(\d+)\s+(.+)" reply
+  #"^tracking" tracking
+  #"^untrack\s+(.+)" untrack
+  #"^track\s+(.+)" track)

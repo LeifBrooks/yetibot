@@ -1,15 +1,20 @@
 (ns yetibot.commands.catfacts
   (:require
     [yetibot.core.hooks :refer [cmd-hook]]
-    [yetibot.core.util.http :refer [get-json]]))
+    [clj-http.client :as client]))
 
-(def endpoint "http://catfacts-api.appspot.com/api/facts")
+(def endpoint "https://catfact.ninja/fact")
+
+(defn- fetch-catfact
+  "Fetches a random catfact"
+  []
+  (client/get endpoint {:as :json}))
 
 (defn catfact
   "catfact # fetch a random cat fact"
   {:yb/cat #{:fun}}
-  [_] (let [res (get-json endpoint)]
-        (first (:facts res))))
+  [_]
+  (-> (fetch-catfact) :body :fact))
 
 (cmd-hook #"catfact"
-          _ catfact)
+  _ catfact)

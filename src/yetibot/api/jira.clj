@@ -1,12 +1,26 @@
 (ns yetibot.api.jira
   (:require
     [taoensso.timbre :refer [info warn error]]
+    [schema.core :as sch]
+    [yetibot.core.schema :refer [non-empty-str]]
     [clojure.string :as s]
     [clj-http.client :as client]
     [clojure.core.memoize :as memo]
-    [yetibot.core.config :refer [get-config conf-valid?]]
+    [yetibot.core.config :refer [get-config]]
     [yetibot.core.util.http :refer [get-json fetch]]
     [clj-time [format :refer [formatter formatters show-formatters parse unparse]]]))
+
+(def jira-schema
+  {:domain non-empty-str
+   :user non-empty-str
+   :password non-empty-str
+   :projects [{:key non-empty-str
+               (sch/optional-key :default) {:version {:id non-empty-str}}}]
+   (sch/optional-key :default)
+   {(sch/optional-key :issue) {:type {:id non-empty-str}}
+    (sch/optional-key :project) {:key non-empty-str}}
+   (sch/optional-key :max) {:results non-empty-str}
+   (sch/optional-key :subtask) {:issue {:type {:id non-empty-str}}}})
 
 ;; config
 
@@ -14,31 +28,53 @@
   "Settings for the current channel, bound by yetibot.commands.jira"
   nil)
 
-(defn config [] (get-config :yetibot :api :jira))
+(def ^:dynamic *jira-projects*
+  "Settings for the current channel, bound by yetibot.commands.jira"
+  nil)
 
-(defn configured? [] (conf-valid? (config)))
+(def jira-project-setting-key
+  "This key is used to store channel-specific JIRA projects"
+  "jira-project")
 
-(defn projects [] (->> (config) :projects))
+(defn channel-projects
+  "Retrieve the list of configured projects for a channel, given its settings"
+  [channel-settings]
+  (when-let [setting (channel-settings jira-project-setting-key)]
+    (s/split setting #",\s*")))
 
-(defn project-for-key [k] (get (projects) k))
+(defn config [] (:value (get-config jira-schema [:jira])))
 
-(defn project-keys [] (keys (projects)))
+(defn configured? [] (config))
 
-(defn project-keys-str [] (->> (project-keys) (s/join ",")))
+(defn projects [] (:projects (config)))
 
-(defn default-version-id [project-key] (:default-version-id (project-for-key project-key)))
+(defn project-for-key [k] (first (filter #(= (:key %) k) (projects))))
+
+(defn project-keys [] (into (vec *jira-projects*)
+                            (map :key (projects))))
+
+(defn project-keys-str [] (s/join "," (into
+                                        (project-keys)
+                                        *jira-projects*)))
+
+(defn default-version-id [project-key] (-> (project-for-key project-key)
+                                           :default :version :id))
 
 (defn default-project-key [] (or *jira-project*
-                                 (:default-project-key (config))
+                                 (first *jira-projects*)
+                                 (-> (config) :default :project :key)
                                  (first (project-keys))))
 
 (defn default-project [] (project-for-key (default-project-key)))
 
-(defn max-results [] (or (:max-results (config)) 10))
+(defn max-results []
+  (if-let [mr (-> (config) :max :results)]
+    (read-string mr)
+    10))
 
-(defn sub-task-issue-type-id [] (:sub-task-issue-type-id (config)))
+(defn sub-task-issue-type-id [] (-> (config) :subtask :issue :type :id ))
 
-(defn default-issue-type-id [] (:default-issue-type-id (config)))
+(defn default-issue-type-id [] (-> (config) :default :issue :type :id))
 
 (defn base-uri [] (str "https://" (:domain (config))))
 
@@ -55,10 +91,10 @@
 
 (def client-opts {:as :json
                   :basic-auth auth
-                  :throw-entire-message? true
+                  :throw-exceptions true
+                  :coerce :unexceptional
+                  :throw-entire-message? false
                   :insecure? true})
-(def error-handling-opts {:coerce :always
-                          :throw-exceptions false})
 
 (defn endpoint [& fmt-with-args]
   (str (api-uri) (apply format fmt-with-args)))
@@ -74,7 +110,7 @@
 
 (defn format-issue [issue-data]
   (let [fs (:fields issue-data)]
-    [(-> fs :summary)
+    [(:summary fs)
      (str "Assignee: " (-> fs :assignee :displayName))
      (str "Status: " (-> fs :status :name))
      (url-from-key (:key issue-data))]))
@@ -84,14 +120,14 @@
     (format "[%s] [%s] %s %s"
             (or (-> fs :assignee :name) "unassigned")
             (-> fs :status :name)
-            (-> fs :summary)
+            (:summary fs)
             (url-from-key (:key issue-data)))))
 
 (defn format-comment [c]
   (str "📞 "
        (-> c :author :name) " "
        (parse-and-format-date-string (:created c))
-       ": " (-> c :body)))
+       ": " (:body c)))
 
 (defn format-worklog-item [w]
   (str "🚧 " (-> w :author :name) " " (:timeSpent w) ": " (:comment w)
@@ -109,7 +145,7 @@
   (str "📎 "
        (-> a :author :name) " "
        (parse-and-format-date-string (:created a))
-       ": " (-> a :content)))
+       ": " (:content a)))
 
 (defn format-attachments [issue-data]
   (when-let [attachments (-> issue-data :fields :attachment)]
@@ -121,8 +157,8 @@
   (let [fs (:fields issue-data)]
     (flatten
       (keep identity
-            [(str (:key issue-data) " ↪︎ " (-> fs :status :name) " ↪︎ " (-> fs :summary))
-             (-> fs :description)
+            [(str (:key issue-data) " ↪︎ " (-> fs :status :name) " ↪︎ " (:summary fs))
+             (:description fs)
              (s/join
                "  "
                [(str "👷 " (-> fs :assignee :name))
@@ -130,7 +166,7 @@
              (s/join
                " "
                [(str "❗️ Priority: " (-> fs :priority :name))
-                (str " ✅ Fix version: " (s/join ", " (map :name (-> fs :fixVersions))))])
+                (str " ✅ Fix version: " (s/join ", " (map :name (:fixVersions fs))))])
              (str "🕐 Created: " (parse-and-format-date-string (:created fs))
                   "  🕗 Updated: " (parse-and-format-date-string (:updated fs)))
              (map format-comment (-> fs :comment :comments))
@@ -180,11 +216,9 @@
   [i]
   (let [uri (endpoint "/issue/%s" i)
         opts (merge client-opts {:query-params {"fields" "*navigable,comment,worklog,attachment"}})]
-    (try
-      (:body (client/get uri opts))
-      (catch Exception _ nil))))
+    (client/get uri opts)))
 
-(def fetch-and-format-issue-short (comp format-issue-short get-issue))
+(def fetch-and-format-issue-short (comp format-issue-short :body get-issue))
 
 (defn find-project [pk]
   (try
@@ -193,11 +227,12 @@
       nil)))
 
 (defn priorities []
-  (:body (client/get (endpoint "/priority") client-opts)))
+  (client/get (endpoint "/priority") client-opts))
 
 (defn find-priority-by-key [k]
   (let [kp (re-pattern (str "(?i)" k))]
-    (first (filter #(re-find kp (:name %)) (priorities)))))
+    (first (filter #(re-find kp (:name %))
+                   (:body (priorities))))))
 
 (defn issue-types []
   (:body (client/get (endpoint "/issuetype") client-opts)))
@@ -231,11 +266,12 @@
            fix-version timetracking issue-type-id parent]
     :or {desc "" assignee "-1"
          issue-type-id (if parent (sub-task-issue-type-id) (default-issue-type-id))
-         project-key (default-project-key)}}]
+         project-key (or (first *jira-projects*)
+                         (default-project-key))}}]
   (if-let [prj (find-project project-key)]
     (if-let [priority (if priority-key
                         (find-priority-by-key priority-key)
-                        (first (priorities)))]
+                        (first (:body (priorities))))]
       (let [pri-id (:id priority)
             prj-id (:id prj)
             fix-version-map (if fix-version
@@ -257,9 +293,7 @@
         (client/post
           (endpoint "/issue")
           (merge client-opts
-                 {:coerce :always
-                  :throw-exceptions false
-                  :form-params params
+                 {:form-params params
                   :content-type :json})))
       (warn "Could not find a priority for key " priority-key))
     (warn "Could not find project" project-key)))
@@ -276,7 +310,6 @@
   (client/put
     (endpoint "/issue/%s/assignee" issue-key)
     (merge client-opts
-           ; error-handling-opts
            {:content-type :json
             :form-params {:name assignee}})))
 
@@ -306,18 +339,14 @@
   (let [re (re-pattern (str "(?i)" pattern-str))]
     (filter #(re-find re (:name %)) (mapcat :body (all-components)))))
 
-:id "28241"
-
 ;; users
 
-(defn get-users []
-  (:body
-    (client/get
-      (endpoint "/user/assignable/multiProjectSearch")
-      (merge client-opts
-             {:query-params
-              {"projectKeys" (project-keys-str)}}))))
-
+(defn get-users [project]
+  (client/get
+    (endpoint "/user/assignable/multiProjectSearch")
+    (merge client-opts
+           {:query-params
+            {"projectKeys" project}})))
 
 ;; search
 
@@ -348,5 +377,4 @@
 (defn recent [] (search (projects-jql)))
 
 ;; prime cache
-
-(future (all-components))
+;; todo: move into a start fn ;; (future (all-components))

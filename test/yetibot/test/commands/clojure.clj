@@ -1,8 +1,11 @@
 (ns yetibot.test.commands.clojure
   (:require
-    [clojure.test :refer :all]
+    [midje.sweet :refer [fact => anything throws]]
     [yetibot.commands.clojure :refer :all]
-    [yetibot.core.parser :refer [parse-and-eval]]))
+    ))
 
-(deftest test-clj
-  (is (= (parse-and-eval "clj (+ 1 2)") "3")))
+(fact "should eval as clojure code and return response using clojail"
+  (clojure-cmd {:args "(* 10 2)"}) => "20")
+
+(fact "should return error message when request fail"
+  (clojure-cmd {:args "(+ 1 B)"}) => (throws Exception))

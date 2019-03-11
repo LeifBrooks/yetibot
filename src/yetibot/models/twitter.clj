@@ -1,49 +1,45 @@
 (ns yetibot.models.twitter
   (:require
+    [yetibot.db.twitter :as db]
+    [yetibot.core.util.http :refer [html-decode]]
+    [yetibot.core.config :refer [get-config]]
+    [yetibot.core.chat :as chat]
+    [schema.core :as sch]
     [taoensso.timbre :refer [info warn error]]
     [clj-http.client :as client]
-    [yetibot.core.util.http :refer [html-decode]]
-    [yetibot.core.config :refer [get-config config-for-ns conf-valid?]]
     [clojure.string :as s :refer [join]]
-    [yetibot.core.chat :as chat]
     [clojure.data.json :as json]
     [twitter.oauth :refer :all]
     [twitter.callbacks :refer :all]
     [twitter.callbacks.handlers :refer :all]
     [twitter.api.restful :refer :all]
-    [twitter.api.streaming :refer :all]
-    [datomico.core :as dc]
-    [datomico.db :refer [q]]
-    [datomico.action :refer [all where raw-where]])
+    [twitter.api.streaming :refer :all])
   (:import
     (twitter.callbacks.protocols SyncSingleCallback)
     (twitter.callbacks.protocols AsyncStreamingCallback)))
 
-;;;; schema for storing topics to track
-
-(def model-namespace :twitter)
-
-(def schema (dc/build-schema model-namespace
-                             [[:user :string]
-                              [:topic :string]]))
-
-(dc/create-model-fns model-namespace)
-
 ;;;; config
 
-(defn config [] (get-config :yetibot :models :twitter))
+(def twitter-schema
+  {:consumer {:key sch/Str
+              :secret sch/Str}
+   :token sch/Str
+   :secret sch/Str
+   :search {:lang sch/Str}})
 
-(defn configured? [] (conf-valid? (config)))
+(def config (:value (get-config twitter-schema [:twitter])))
 
 (def creds (apply make-oauth-creds
-                  ((juxt :consumer-key :consumer-secret :token :secret) (config))))
+                  ((juxt (comp :key :consumer)
+                         (comp :secret :consumer)
+                         :token :secret) config)))
 
 ;;;; helper
 
 (defn format-url [user id] (format "https://twitter.com/%s/status/%s" user id))
 
 (defn expand-url [url]
-  (let [resp (client/get url)]
+  (let [resp (client/get url {:follow-redirects true})]
     (if-let [redirs (:trace-redirects resp)]
       (last redirs)
       url)))
@@ -72,9 +68,8 @@
                (str "RT " (format-screen-name retweeted-status) ": "
                     (format-tweet-text retweeted-status))
                (format-tweet-text json))]
-    ; (info json)
     (format "%s — @%s %s"
-            (-> text html-decode)
+            (html-decode text)
             ; (-> (:text json) expand-twitter-urls html-decode)
             screen-name url)))
 
@@ -110,7 +105,7 @@
   (info "twitter search for" query)
   (search-tweets
     :oauth-creds creds
-    :params {:count 20 :q query :lang (:search_lang (config))}))
+    :params {:count 20 :q query :lang (:lang (:search config))}))
 
 ;;;; topic tracking
 
@@ -125,14 +120,14 @@
                            :oauth-creds creds
                            :callbacks streaming-callback)))
 
-(defn reload-topics [] (reset-streaming-topics (map :topic (find-all))))
+(defn reload-topics [] (reset-streaming-topics (map :topic (db/find-all))))
 
 (defn add-topic [user-id topic]
-  (create {:user user-id :topic topic})
+  (db/create {:user-id user-id :topic topic})
   (reload-topics))
 
 (defn remove-topic [topic-id]
-  (dc/delete topic-id)
+  (db/delete topic-id)
   (reload-topics))
 
 ;; on startup, load the existing topics
@@ -158,7 +153,7 @@
                                              :cursor cursor}))
           current-users (into users (:users body))
           next-cursor (:next_cursor body)]
-      (if (or (> iter 10) (= 0 next-cursor)) ; limit to 10 pages
+      (if (or (> iter 10) (zero? next-cursor)) ; limit to 10 pages
         current-users
         ; keep looping to fetch all pages until cursor is 0
         (recur next-cursor current-users (inc iter))))))
@@ -180,7 +175,22 @@
 
 ;;;; users
 
-(defn user-timeline [screen-name]
-  (statuses-user-timeline :oauth-creds creds
-                          :params {:screen-name screen-name
-                                   :count 3}))
+(defn user-timeline [screen-name & tweet-count]
+   (statuses-user-timeline :oauth-creds creds
+                           :params {:screen-name screen-name
+                                    :count (if-not (nil? tweet-count)
+                                             tweet-count
+                                             3)}))
+;;;; show tweet with id
+
+(defn show [id]
+  (statuses-show-id :oauth-creds creds
+                    :params {:id id}))
+
+;; db helpers
+
+(defn find-by-topic [topic]
+  (db/query {:where/map {:topic topic}}))
+
+(defn find-all []
+  (db/find-all))

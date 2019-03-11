@@ -1,7 +1,12 @@
 (ns yetibot.api.github
   (:require
     [taoensso.timbre :refer [info warn error]]
+    [schema.core :as sch]
+    [yetibot.core.schema :refer [non-empty-str]]
+    [clojure.data.csv :as csv]
+    [clojure.java.io :as io]
     [tentacles
+     [core :refer [with-url]]
      [search :as search]
      [pulls :as pulls]
      [issues :as issues]
@@ -12,9 +17,9 @@
      [orgs :as o]]
     [clojure.string :as s]
     [clj-http.client :as client]
-    [yetibot.core.config :refer [get-config conf-valid?]]
-    [yetibot.core.util.http :refer [fetch]]))
-
+    [graphql-query.core :refer [graphql-query]]
+    [yetibot.core.config :refer [get-config]]
+    [yetibot.core.util.http :refer [encode]]))
 
 ;;; uses tentacles for most api calls, but falls back to raw REST calls when
 ;;; tentacles doesn't support something (like Accept headers for raw blob
@@ -22,18 +27,20 @@
 
 ;;; config
 
-(defn config [] (get-config :yetibot :api :github))
-(defn configured? [] (conf-valid? (config)))
+(def github-schema
+  {:token non-empty-str
+   :org [non-empty-str]
+   (sch/optional-key :graphql) {:endpoint non-empty-str}
+   (sch/optional-key :endpoint) non-empty-str})
+
+(defn config [] (:value (get-config github-schema [:github])))
+(defn configured? [] (config))
 (def endpoint (or (:endpoint (config)) "https://api.github.com/"))
-
-; propogate the configured endpoint to the tentacles library
-
-(alter-var-root #'tentacles.core/url (constantly endpoint))
 
 (def token (:token (config)))
 (def auth {:oauth-token token})
 (future
-  (def user (u/me auth))
+  (def user (with-url endpoint (u/me auth)))
   (def user-name (:login user)))
 
 ; ensure org-names is a sequence; config allows either
@@ -46,12 +53,45 @@
 ;                   (o/orgs auth))))
 
 
+;; graphql examples
+
+(defn contrib-query [username]
+  (str "query {
+      user(login: \\\"" username "\\\") {
+        login
+        repositoriesContributedTo(first: 100,
+                                  includeUserRepositories: false,
+                                  contributionTypes: [COMMIT, PULL_REQUEST]) {
+          totalCount
+          nodes {
+            nameWithOwner
+            owner {
+              ... on Organization {
+                name
+              }
+            }
+          }
+        }
+      }
+    }"))
+
+(defn graphql [query]
+  (client/post
+    (-> (config) :graphql :endpoint)
+    {:headers {"Authorization" (str "bearer " (:token (config)))}
+     :body (str "{\"query\": \"" (s/replace query #"\n" "") "\"}")
+     :as :json}))
+
+(defn email->username [email]
+  (first (s/split email #"\@")))
+
 ;;; data
 
 (defn tree
   [org-name repo & [opts]]
-  (data/tree org-name repo (or (:branch opts) "master")
-          (merge auth {:recursive true} opts)))
+  (with-url endpoint
+    (data/tree org-name repo (or (:branch opts) "master")
+              (merge auth {:recursive true} opts))))
 
 (defn find-paths [tr pattern]
   (filter #(re-find pattern (:path %)) (:tree tr)))
@@ -84,26 +124,45 @@
 ;;; repos
 
 (defn repos [org-name]
-  (remove :fork (remove empty? (r/org-repos org-name (merge auth {:per-page 100})))))
+  (remove :fork (remove empty?
+                  (with-url endpoint
+                    (r/org-repos org-name (merge auth {:per-page 100}))))))
 
 (defn repos-by-org []
   (into {} (for [org-name (org-names)]
              [org-name (repos org-name)])))
 
 (defn branches [org-name repo]
-  (r/branches org-name repo auth))
+  (with-url endpoint
+    (r/branches org-name repo auth)))
 
 (defn tags [org-name repo]
-  (r/tags org-name repo auth))
+  (with-url endpoint
+    (r/tags org-name repo auth)))
 
 (defn pulls [org-name repo]
-  (pulls/pulls org-name repo auth))
+  (with-url endpoint
+    (pulls/pulls org-name repo auth)))
 
 (defn contributor-statistics [org-name repo]
-  (r/contributor-statistics org-name repo auth))
+  (with-url endpoint
+    (r/contributor-statistics org-name repo auth)))
 
 (defn code-frequency [org-name repo]
-  (r/code-frequency org-name repo auth))
+  (with-url endpoint
+    (r/code-frequency org-name repo auth)))
+
+(defn latest-releases [org-name repo]
+  (with-url endpoint
+    (r/specific-release org-name repo "latest")))
+
+(defn release-by-tag [org-name repo tag]
+  (with-url endpoint
+    (r/specific-release-by-tag org-name repo tag)))
+
+(defn releases [org-name repo]
+  (with-url endpoint
+    (r/releases org-name repo)))
 
 (defn sum-weekly
   "Takes the weekly stats for an author and sums them into:
@@ -130,18 +189,46 @@
         weekly-by-author)
       weekly-by-author)))
 
+(defn filter-since-ts
+  "Stats is a collection of statistics with a :w timestamp key.
+   If ts is nil return the stats coll as-is"
+  [stats ts]
+  (if ts
+    (filter (fn [stat]
+              ;; gh timestamps are seconds and joda is milliseconds
+              ;; so we must multiply by 1000
+              (>= (* 1000 (:w stat)) ts))
+            stats)
+    stats))
+
+(defn contributors-since-ts
+  "If ts is nil it gets stats for max time (52 weeks)"
+  [org repo ts]
+  (let [stats (contributor-statistics org repo)]
+    (->> stats
+         (map (fn [contrib-stat]
+                (let [filtered (filter-since-ts (:weeks contrib-stat) ts)]
+                  (merge
+                    (select-keys (sum-weekly filtered) [:a :d :c])
+                    {:author (-> contrib-stat :author :login)}))))
+         (filter #(pos? (:c %)))
+         (sort-by :c)
+         reverse)))
+
 ;;; (defn contents [repo path]
 ;;;   (r/contents org-name repo path auth))
 
 (defn org-issues [org-name]
-  (issues/org-issues org-name auth))
+  (with-url endpoint
+    (issues/org-issues org-name auth)))
 
 ;; search
 
 (defn search-pull-requests [org-name keywords & [opts]]
-  (search/search-issues keywords
-                        (merge {:state "open" :type "pr" :user org-name} opts)
-                        (merge {:sort "created"} auth)))
+  (with-url endpoint
+    (search/search-issues keywords
+                          (merge {:state "open" :type "pr" :user org-name} opts)
+                          (merge {:sort "created"} auth))))
 
 
 ;;; events / feed
@@ -156,7 +243,7 @@
               (-> e :repo :name))]
         (map (fn [{:keys [author sha message]}]
                (str "* "
-                    (apply str (take 7 sha))
+                    (s/join (take 7 sha))
                     " "
                     message
                     " [" (:name author) "]"))
@@ -173,8 +260,7 @@
   (map fmt-event evts))
 
 (defn events [org-name]
-  (e/org-events user-name org-name auth))
+  (with-url endpoint (e/org-events user-name org-name auth)))
 
 (defn formatted-events [org-name]
   (fmt-events (events org-name)))
-
